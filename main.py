@@ -1,3 +1,4 @@
+import collections
 import datetime
 import json
 import os
@@ -585,20 +586,110 @@ def handle(command):
     return True
 
 
+# ---------------------------------------------------------------- hands-free (wake word)
+
+USE_WAKE_WORD = True  # False = old style: press Enter, then speak
+WAKE_WORDS = ("jarvis", "jarves", "jervis")
+THRESHOLD = 600  # how loud counts as speech (set automatically at startup)
+
+
+def mic_rate():
+    return int(sd.query_devices(kind="input")["default_samplerate"])
+
+
+def calibrate():
+    """Listen to the room for 1 second so Jarvis knows what 'quiet' sounds like."""
+    global THRESHOLD
+    fs = mic_rate()
+    print("Calibrating... stay quiet for 1 second")
+    data = sd.rec(int(fs * 1.0), samplerate=fs, channels=1, dtype="int16")
+    sd.wait()
+    THRESHOLD = max(600, int(abs(data).max()) * 2.5)
+    print("Speech threshold set to", THRESHOLD)
+
+
+def record_until_silence(wait_seconds=None, max_seconds=10):
+    """Wait for speech, record it, stop after 1 second of silence.
+    Returns (audio, rate), or None if nothing was said within wait_seconds."""
+    fs = mic_rate()
+    block = int(fs * 0.1)  # 0.1 second per block
+    before = collections.deque(maxlen=3)  # keeps the moment just before speech starts
+    chunks = []
+    started = False
+    silent = 0
+    waited = 0.0
+    with sd.InputStream(samplerate=fs, channels=1, dtype="int16", blocksize=block) as stream:
+        while True:
+            data, _ = stream.read(block)
+            loud = int(abs(data).max()) > THRESHOLD
+            if not started:
+                if loud:
+                    started = True
+                    chunks.extend(before)
+                    chunks.append(data)
+                else:
+                    before.append(data)
+                    waited += 0.1
+                    if wait_seconds is not None and waited >= wait_seconds:
+                        return None
+            else:
+                chunks.append(data)
+                silent = 0 if loud else silent + 1
+                if silent >= 10 or len(chunks) >= max_seconds * 10:
+                    break
+    return np.concatenate(chunks), fs
+
+
+def transcribe(audio):
+    if audio is None:
+        return ""
+    data, fs = audio
+    try:
+        return recognize(data, fs)
+    except urllib.error.URLError as e:
+        print("Internet/Google error:", e)
+    except Exception as e:
+        print("Error:", repr(e))
+    return ""
+
+
+def wait_for_wake_word():
+    """Listen forever. When someone says 'Jarvis', return what came after it (may be empty)."""
+    while True:
+        text = transcribe(record_until_silence())
+        if not text:
+            continue
+        print("(heard:", text + ")")
+        for word in WAKE_WORDS:
+            if word in text:
+                return text.split(word, 1)[1].strip(" ,.")
+
+
 def main():
     print("--- Brain self-check ---")
     check_brains()
     print("------------------------")
-    speak("Jarvis is online. How can I help?")
+
+    if USE_WAKE_WORD:
+        calibrate()
+        speak("Jarvis is online. Say Jarvis, then your command.")
+    else:
+        speak("Jarvis is online. How can I help?")
 
     while True:
         try:
-            input("\nPress Enter, then speak: ")
+            if USE_WAKE_WORD:
+                command = wait_for_wake_word()
+                if not command:  # they only said "Jarvis" - ask for the command
+                    speak("Yes?")
+                    command = transcribe(record_until_silence(wait_seconds=6))
+            else:
+                input("\nPress Enter, then speak: ")
+                command = listen()
         except (KeyboardInterrupt, EOFError):
             print("\nStopped.")
             break
 
-        command = listen()
         if not command:
             continue
         print("You:", command)
