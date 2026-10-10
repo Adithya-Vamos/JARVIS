@@ -169,6 +169,10 @@ HUD_HTML = r"""<!doctype html>
     letter-spacing: .25em; color: #19e6ff; background: #06202c; border: 1px solid #19e6ff66;
     padding: 9px 14px; cursor: pointer; border-radius: 3px; user-select: none; }
   #qbtn:hover { background: #0a3347; }
+  #mctl { position: fixed; right: 22px; top: 98px; display: flex; flex-direction: column; gap: 6px; }
+  .mbtn { font: inherit; font-size: 11px; letter-spacing: .25em; color: #19e6ff; background: #06202c;
+    border: 1px solid #19e6ff66; padding: 8px 14px; cursor: pointer; border-radius: 3px; user-select: none; }
+  .mbtn:hover { background: #0a3347; }
 </style>
 </head>
 <body>
@@ -180,6 +184,11 @@ HUD_HTML = r"""<!doctype html>
 <div id="brand">J.A.R.V.I.S</div>
 <div id="status">STARTING</div>
 <div id="log"></div>
+<div id="mctl">
+  <button class="mbtn" id="mprev" title="Previous song">PREV</button>
+  <button class="mbtn" id="mplay" title="Play or pause">PLAY / PAUSE</button>
+  <button class="mbtn" id="mnext" title="Next song">NEXT</button>
+</div>
 <button id="qbtn" title="Switch quiet mode on or off">QUIET</button>
 <script>
 (function () {
@@ -322,6 +331,13 @@ HUD_HTML = r"""<!doctype html>
     }
   };
 
+  function media(a) {
+    if (window.pywebview && window.pywebview.api) { window.pywebview.api.media(a); }
+  }
+  document.getElementById('mprev').onclick = function () { media('previous'); };
+  document.getElementById('mplay').onclick = function () { media('play_pause'); };
+  document.getElementById('mnext').onclick = function () { media('next'); };
+
   function tick() {
     var n = new Date();
     function p(x) { return (x < 10 ? '0' : '') + x; }
@@ -379,6 +395,10 @@ HUD = Hud()
 
 class HudApi:
     """Buttons in the HUD call these."""
+
+    def media(self, action):
+        tool_media_control(action)
+        return True
 
     def toggle_quiet(self):
         set_lock(not STATE["lock"])
@@ -651,6 +671,9 @@ def transcribe(audio):
 
 
 AMBIENT = 300.0  # how loud the room is when nobody speaks (updates itself)
+ROOM = {"base": None, "recent": collections.deque(maxlen=40)}  # quiet-room level, last 4 s of background
+NOISY_TRIGGER = 1.8      # over music/video, speech must be this many times louder than the background
+NOISY_CLIP_BLOCKS = 40   # over music/video, take a 4 second clip (a pause in the sound never comes)
 LAST = {"hit_max": False}  # did the last recording run to the maximum (music or a video)?
 
 
@@ -667,20 +690,28 @@ def calibrate():
     data = sd.rec(int(fs * 1.0), samplerate=fs, channels=1, dtype="int16")
     sd.wait()
     AMBIENT = max(100.0, float(abs(data).max()))
+    ROOM["base"] = AMBIENT
+    ROOM["recent"].clear()
     print("Room noise level:", int(AMBIENT))
 
 
 def record_until_silence(wait_seconds=None, max_seconds=None, pause_seconds=None):
     """Wait for speech, record it, stop after a pause.
+    Also works over steady background sound (music, a video): your voice has to stand out from it.
     Returns (audio, rate), or None if nothing was said within wait_seconds."""
     global AMBIENT
     max_seconds = max_seconds or MAX_SECONDS
     pause_blocks = int((pause_seconds or PAUSE_SECONDS) * 10)
     fs = mic_rate()
     block = int(fs * 0.1)  # 0.1 second per block
+    base = ROOM["base"] or AMBIENT
+    recent = ROOM["recent"]  # loudness of the last 4 seconds of background (never speech)
     before = collections.deque(maxlen=3)  # the moment just before speech starts
+    pending = []  # loud blocks that may be the start of speech
     chunks = []
+    levels = []
     started = False
+    noisy = False  # True = something loud is playing (music, video): take a short clip
     silent = 0
     waited = 0.0
     LAST["hit_max"] = False
@@ -690,22 +721,41 @@ def record_until_silence(wait_seconds=None, max_seconds=None, pause_seconds=None
             level = int(abs(data).max())
             HUD.level(level)
             if not started:
-                if level > max(500, AMBIENT * 3):
-                    started = True
-                    chunks.extend(before)
-                    chunks.append(data)
-                else:
-                    AMBIENT = 0.9 * AMBIENT + 0.1 * level  # keep learning the room
-                    before.append(data)
-                    waited += 0.1
-                    if wait_seconds is not None and waited >= wait_seconds:
-                        return None
+                floor = max(AMBIENT, float(np.median(recent)) if recent else 0.0)
+                loud_room = floor > base * 2.5
+                trigger = max(500.0, floor * (NOISY_TRIGGER if loud_room else 3.0))
+                if level > trigger:
+                    pending.append((data, level))
+                    if len(pending) >= (2 if loud_room else 1):
+                        started = True
+                        noisy = loud_room
+                        chunks.extend(before)
+                        chunks.extend(d for d, _ in pending)
+                        levels.extend(l for _, l in pending)
+                    continue
+                for d, l in pending:  # a short blip, not speech: count it as background
+                    recent.append(l)
+                    before.append(d)
+                pending.clear()
+                recent.append(level)
+                before.append(data)
+                AMBIENT = 0.9 * AMBIENT + 0.1 * level  # keep learning the room
+                waited += 0.1
+                if wait_seconds is not None and waited >= wait_seconds:
+                    return None
             else:
                 chunks.append(data)
+                levels.append(level)
+                if noisy:
+                    if len(chunks) >= min(NOISY_CLIP_BLOCKS, max_seconds * 10):
+                        break  # over loud music a pause never comes, so take a short clip
+                    continue
                 silent = 0 if level > max(300, AMBIENT * 1.8) else silent + 1
                 LAST["hit_max"] = len(chunks) >= max_seconds * 10
                 if silent >= pause_blocks or LAST["hit_max"]:
                     break
+    if LAST["hit_max"]:  # a long steady sound, not speech: learn it as background
+        recent.extend(levels[-40:])
     return np.concatenate(chunks), fs
 
 
@@ -721,7 +771,7 @@ def strip_wake(text):
     return text.strip(" ,.!?")
 
 
-QUIET_WAKE = re.compile(r"\b(?:hey|hay|hi|ok|okay)\s*,?\s*(?:jarvis|jarves|jervis|jarvi)\b")
+QUIET_WAKE = re.compile(r"\b(?:(?:hey|hay|hi|ok|okay)\s*,?\s*)?(?:jarvis|jarves|jervis|jarvi)\b")
 
 
 def wait_for_quiet_wake():
@@ -736,6 +786,9 @@ def wait_for_quiet_wake():
             continue
         print("(heard:", quick + ")")
         if not QUIET_WAKE.search(quick):
+            bare = quick.strip(" .!?,")
+            if bare in QUIET_OFF_PHRASES:
+                return bare  # just "wake up" (no name needed)
             continue
         full = whisper_transcribe(data, fs)
         text = full if QUIET_WAKE.search(full) else quick
@@ -896,14 +949,30 @@ def tool_play_music(song):
 MEDIA_KEYS = {"play_pause": 179, "next": 176, "previous": 177}
 
 
+MEDIA_VKEYS = {"play_pause": 0xB3, "next": 0xB0, "previous": 0xB1}
+
+
+def press_media_key(vk):
+    """Press a real media key (same as the play/pause key on a keyboard)."""
+    import ctypes
+    user32 = ctypes.windll.user32
+    user32.keybd_event(vk, 0, 1, 0)      # key down (extended key)
+    time.sleep(0.03)
+    user32.keybd_event(vk, 0, 1 | 2, 0)  # key up
+
+
 def tool_media_control(action):
-    code = MEDIA_KEYS.get(action)
-    if code is None:
+    vk = MEDIA_VKEYS.get(action)
+    if vk is None:
         return "Media action must be play_pause, next or previous."
-    run_hidden([
-        "powershell", "-NoProfile", "-Command",
-        f"$w = New-Object -ComObject WScript.Shell; $w.SendKeys([char]{code})",
-    ])
+    try:
+        press_media_key(vk)
+    except Exception as e:  # backup: the old PowerShell way
+        print("Media key failed, trying PowerShell:", repr(e))
+        run_hidden([
+            "powershell", "-NoProfile", "-Command",
+            f"$w = New-Object -ComObject WScript.Shell; $w.SendKeys([char]{MEDIA_KEYS[action]})",
+        ])
     return "Done."
 
 
@@ -1416,12 +1485,66 @@ def check_brains():
 
 # ---------------------------------------------------------------- commands
 
+MEDIA_VERBS = {
+    "pause": "play_pause", "unpause": "play_pause", "resume": "play_pause",
+    "continue": "play_pause", "play": "play_pause", "stop": "play_pause",
+    "next": "next", "skip": "next",
+    "previous": "previous", "back": "previous", "rewind": "previous",
+}
+MEDIA_FILLER = {"the", "this", "that", "my", "current", "song", "songs", "music", "video",
+                "videos", "track", "youtube", "it", "please", "now", "playing", "audio",
+                "go", "one", "again"}
+PLAY_NAME_WORDS = {"music", "song", "songs", "track", "audio", "youtube"}
+
+
+def media_action(text):
+    """'pause the youtube song' -> 'play_pause', 'skip this song' -> 'next'. None if not a media command."""
+    words = re.findall(r"[a-z']+", text.lower())
+    if not words or len(words) > 6:
+        return None
+    verbs = [w for w in words if w in MEDIA_VERBS]
+    others = [w for w in words if w not in MEDIA_VERBS and w not in MEDIA_FILLER]
+    if not verbs or others:
+        return None
+    actions = {MEDIA_VERBS[v] for v in verbs}
+    if "next" in actions:
+        return "next"
+    if "previous" in actions:
+        return "previous"
+    if set(verbs) == {"play"} and PLAY_NAME_WORDS & set(words):
+        return None  # "play music" / "play the song" is a search, not a resume
+    return "play_pause"
+
+
+def volume_action(text):
+    t = text.lower()
+    if re.search(r"\b(?:un)?mute\b", t):
+        return "mute"
+    if re.search(r"\b(volume up|louder|turn it up|turn up the volume|increase the volume|raise the volume)\b", t):
+        return "up"
+    if re.search(r"\b(volume down|quieter|softer|turn it down|turn down the volume|decrease the volume|lower the volume)\b", t):
+        return "down"
+    return None
+
+
 def fast_command(text):
     """Instant commands that skip the AI (faster and more reliable). Returns a reply or None."""
     text = re.sub(r"^(please |can you |could you )", "", text).strip()
 
-    if text in MEDIA_PHRASES:
-        return tool_media_control(MEDIA_PHRASES[text])
+    action = media_action(text)
+    if action:
+        return tool_media_control(action)
+
+    if len(text.split()) <= 5:
+        volume = volume_action(text)
+        if volume:
+            return tool_set_volume(volume)
+        if re.search(r"\b(what time is it|what is the time|what's the time|current time|time now|tell me the time)\b", text):
+            return "It is " + datetime.datetime.now().strftime("%I:%M %p").lstrip("0") + "."
+        if re.search(r"\b(what is the date|what's the date|today's date|what day is it|what is today|what's today)\b", text):
+            return "Today is " + datetime.datetime.now().strftime("%A, %d %B %Y") + "."
+        if re.search(r"\bbattery\b", text):
+            return tool_get_system_status()
 
     match = re.match(r"open (?:the )?(.+?)(?: website| app| application)?$", text)
     if match:
@@ -1459,11 +1582,16 @@ QUIET_ON_PHRASES = {"go quiet", "be quiet", "quiet mode", "silent mode", "stay q
                     "quiet please", "shh", "shush"}
 QUIET_OFF_PHRASES = {"wake up", "normal mode", "come back", "stop being quiet", "talk to me",
                      "speak to me", "i'm back", "im back", "quiet mode off", "disable quiet mode"}
+QUIET_OFF_PHRASES |= {"wake", "wakeup", "wake up now", "wake up please", "get up",
+                      "come online", "back online", "i am back"}
 
 
 def handle(command):
     """Run one command. Returns 'quit', 'sleep' (stop follow-up listening) or 'ok'."""
     text = command.strip(" .!?,")
+    # "wake up jarvis" / "jarvis pause": the name at the start or end is not part of the command
+    text = re.sub(r"^(?:(?:hey|hi|ok|okay)[ ,]+)?(?:jarvis|jarves|jervis)\b[ ,]*"
+                  r"|[ ,]*\b(?:jarvis|jarves|jervis)$", "", text).strip(" .!?,") or text
     words = text.split()
     STATE["enter_quiet"] = False
 
