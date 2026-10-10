@@ -56,6 +56,8 @@ VOICE = "en-GB-RyanNeural"  # a calm British voice. Others: en-US-GuyNeural, en-
 VOICE_RATE = "+5%"
 QUIET_AFTER_OPEN = True   # go silent after opening an app or website
 QUIET_FOLLOW_UP_SECONDS = 8  # in quiet mode, how long it keeps listening after you call it
+HOME_CITY = "Bangalore"   # used when you ask for the weather without a city
+VISION_HIDE_HUD = True    # hide the Jarvis window for a moment so it does not cover your screen
 
 GOOGLE_SPEECH_KEY = "AIzaSyBOti4mM-6x9WDnZIjIeyEU21OpBXqWBgw"
 GEMINI_MODELS = ["gemini-flash-latest", "gemini-flash-lite-latest", "gemini-2.5-flash"]
@@ -542,7 +544,8 @@ def speak(text, silent=False):
         return
     HUD.state("speaking")
     try:
-        voice(text)
+        with SPEAK_LOCK:
+            voice(text)
     finally:
         HUD.state("standby" if STATE["lock"] and not STATE["woken"] else "idle")
 
@@ -1037,12 +1040,101 @@ def tool_set_volume(action):
     return f"Volume {action} done."
 
 
+REMINDER_FILE = os.path.join(app_dir(), "jarvis_reminders.json")
+REMINDER_LOCK = threading.Lock()
+REMINDER_POLL = 5  # seconds between checks
+SPEAK_LOCK = threading.Lock()  # one voice at a time
+
+
+def load_reminders():
+    try:
+        with open(REMINDER_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return [r for r in data if isinstance(r, dict) and "due" in r and "text" in r]
+    except (FileNotFoundError, json.JSONDecodeError, TypeError):
+        return []
+
+
+def save_reminders(items):
+    with open(REMINDER_FILE, "w", encoding="utf-8") as f:
+        json.dump(items, f, indent=2)
+
+
+def announce(text):
+    """Say it out loud even in quiet mode (a reminder has to be heard)."""
+    show(text)
+    HUD.state("speaking")
+    try:
+        with SPEAK_LOCK:
+            voice(text)
+    finally:
+        HUD.state("standby" if STATE["lock"] and not STATE["woken"] else "idle")
+
+
 def tool_set_reminder(minutes, message):
     minutes = float(minutes)
-    timer = threading.Timer(minutes * 60, lambda: speak("Reminder: " + message))
-    timer.daemon = True
-    timer.start()
+    with REMINDER_LOCK:
+        items = load_reminders()
+        items.append({"due": time.time() + minutes * 60, "text": message})
+        save_reminders(items)
     return f"Reminder set for {minutes:g} minutes from now."
+
+
+def tool_list_reminders():
+    with REMINDER_LOCK:
+        items = sorted(load_reminders(), key=lambda r: r["due"])
+    if not items:
+        return "You have no reminders."
+    parts = []
+    for r in items[:5]:
+        when = datetime.datetime.fromtimestamp(r["due"]).strftime("%I:%M %p").lstrip("0")
+        parts.append(f"{r['text']} at {when}")
+    return f"You have {len(items)} reminder" + ("s" if len(items) != 1 else "") + ": " + "; ".join(parts) + "."
+
+
+def tool_clear_reminders():
+    with REMINDER_LOCK:
+        count = len(load_reminders())
+        save_reminders([])
+    return f"Cleared {count} reminder" + ("s." if count != 1 else ".")
+
+
+def reminder_loop():
+    first = True
+    while True:
+        try:
+            with REMINDER_LOCK:
+                items = load_reminders()
+                now = time.time()
+                due_now = [r for r in items if r["due"] <= now]
+                if due_now:
+                    save_reminders([r for r in items if r["due"] > now])
+            for r in due_now:
+                missed = first and now - r["due"] > 90
+                announce(("You missed a reminder while I was off: " if missed else "Reminder: ") + r["text"])
+        except Exception as e:
+            print("Reminder error:", repr(e))
+        first = False
+        time.sleep(REMINDER_POLL)
+
+
+def start_reminders():
+    threading.Thread(target=reminder_loop, daemon=True).start()
+
+
+WEATHER_WORDS = {
+    0: "clear sky", 1: "mainly clear", 2: "partly cloudy", 3: "overcast",
+    45: "foggy", 48: "foggy", 51: "light drizzle", 53: "drizzle", 55: "heavy drizzle",
+    56: "freezing drizzle", 57: "freezing drizzle", 61: "light rain", 63: "rain", 65: "heavy rain",
+    66: "freezing rain", 67: "freezing rain", 71: "light snow", 73: "snow", 75: "heavy snow",
+    77: "snow grains", 80: "light rain showers", 81: "rain showers", 82: "heavy rain showers",
+    85: "snow showers", 86: "heavy snow showers", 95: "a thunderstorm",
+    96: "a thunderstorm with hail", 99: "a thunderstorm with hail",
+}
+
+
+def weather_words(code):
+    return WEATHER_WORDS.get(int(code), "unclear conditions")
 
 
 def tool_get_weather(city):
@@ -1068,7 +1160,7 @@ def tool_get_weather(city):
             f"In {p['name']}: {c['temperature_2m']} degrees Celsius, "
             f"humidity {c['relative_humidity_2m']} percent, "
             f"wind {c['wind_speed_10m']} kilometres per hour, "
-            f"WMO weather code {c['weather_code']}."
+            f"{weather_words(c['weather_code'])}."
         )
     except Exception as e:
         return f"Weather lookup failed: {e}"
@@ -1139,6 +1231,85 @@ def tool_open_folder(name):
     return "Opened " + key + "."
 
 
+def screen_request(text):
+    """'what's on my screen' / 'explain this error' -> the question to ask about the screen, else None."""
+    t = text.lower()
+    if len(t.split()) > 14:
+        return None
+    patterns = (
+        r"\bwhat(?:'s| is| am i)?\b.*\b(?:on|at|in)\b.*\bscreen\b",
+        r"\b(?:look at|read|describe|analy[sz]e|summari[sz]e|scan|check)\b.*\b(?:my|the|this)\s+screen\b",
+        r"\bcan you see\b.*\bscreen\b",
+        r"\bwhat am i (?:looking at|seeing)\b",
+        r"\b(?:explain|fix|solve|translate|summari[sz]e|read)\s+(?:this|that|the)\s+(?:error|code|problem|question|page|text|message|bug|screen)\b",
+        r"\bwhat(?:'s| is) this error\b",
+        r"\bwhat does this (?:error|say|mean)\b",
+    )
+    if any(re.search(p, t) for p in patterns):
+        return text
+    return None
+
+
+def tool_look_at_screen(question=""):
+    """Take a screenshot (not saved to disk) and let Gemini answer a question about it."""
+    import base64
+    key = os.environ.get("GEMINI_API_KEY")
+    if not key:
+        return "I need the Gemini key to look at your screen."
+    try:
+        from PIL import ImageGrab
+    except Exception:
+        return "I need Pillow for that. Run: python -m pip install pillow"
+
+    hidden = False
+    if VISION_HIDE_HUD and HUD.window is not None and HUD.ready:
+        try:
+            HUD.window.minimize()  # so the Jarvis window does not cover what you want to show
+            hidden = True
+            time.sleep(0.7)
+        except Exception:
+            pass
+    try:
+        image = ImageGrab.grab().convert("RGB")
+    finally:
+        if hidden:
+            try:
+                HUD.window.restore()
+            except Exception:
+                pass
+
+    image.thumbnail((1600, 1600))
+    buffer = io.BytesIO()
+    image.save(buffer, "JPEG", quality=80)
+    picture = base64.b64encode(buffer.getvalue()).decode("ascii")
+
+    ask = (question or "").strip() or "What is on my screen?"
+    prompt = (
+        "You are Jarvis, a helpful voice assistant. The user is showing you a screenshot of their "
+        f"screen and said: {ask}. Answer that directly. If it is an error, say what it means and the "
+        "most likely fix. If it is a question or a problem, solve it. Answer in at most four short "
+        "sentences of plain spoken English. Do not use markdown, bullet points, emojis or special symbols."
+    )
+    headers = {"Content-Type": "application/json", "x-goog-api-key": key}
+    for model in GEMINI_MODELS[:2]:
+        url = ("https://generativelanguage.googleapis.com/v1beta/models/"
+               f"{model}:generateContent")
+        result = post_json(url, {
+            "contents": [{"role": "user", "parts": [
+                {"text": prompt},
+                {"inline_data": {"mime_type": "image/jpeg", "data": picture}},
+            ]}],
+        }, headers)
+        try:
+            parts = result["candidates"][0]["content"]["parts"]
+            text = clean("".join(p.get("text", "") for p in parts))
+            if text:
+                return text
+        except (TypeError, KeyError, IndexError):
+            pass
+    return "I could not read the screen right now. Try again in a minute."
+
+
 STR = {"type": "STRING"}
 NUM = {"type": "NUMBER"}
 
@@ -1182,6 +1353,14 @@ TOOLS = [{"functionDeclarations": [
     {"name": "remember",
      "description": "Save a lasting fact about the user (name, preferences, plans) to long-term memory.",
      "parameters": params({"fact": STR}, ["fact"])},
+    {"name": "look_at_screen",
+     "description": "Look at the user's screen right now and answer about it: what is on screen, "
+                    "explain an error, solve the question shown, summarize the page, read the text.",
+     "parameters": {"type": "OBJECT", "properties": {"question": STR}}},
+    {"name": "list_reminders",
+     "description": "Tell the user which reminders are pending."},
+    {"name": "clear_reminders",
+     "description": "Delete all pending reminders."},
     {"name": "forget",
      "description": "Delete saved memory items that contain a keyword.",
      "parameters": params({"keyword": STR}, ["keyword"])},
@@ -1211,6 +1390,9 @@ FUNCTIONS = {
     "get_weather": tool_get_weather,
     "remember": tool_remember,
     "forget": tool_forget,
+    "look_at_screen": tool_look_at_screen,
+    "list_reminders": tool_list_reminders,
+    "clear_reminders": tool_clear_reminders,
     "take_screenshot": tool_take_screenshot,
     "close_app": tool_close_app,
     "lock_pc": tool_lock_pc,
@@ -1255,7 +1437,9 @@ def build_system_prompt():
         + "If the user asks to play a song or video, call play_music. "
         + "If you are not sure about a fact, or it is about recent events, new products, "
         + "technology or people, call look_up instead of guessing. Never invent facts. "
-        + "Call remember when the user shares something worth keeping long term."
+        + "Call remember when the user shares something worth keeping long term. "
+        + "If the user asks you to look at their screen, call look_at_screen. "
+        + f"If the user asks about the weather without naming a city, use {HOME_CITY}."
     )
 
 
@@ -1546,6 +1730,31 @@ def fast_command(text):
         if re.search(r"\bbattery\b", text):
             return tool_get_system_status()
 
+    question = screen_request(text)
+    if question:
+        return tool_look_at_screen(question)
+
+    match = re.match(r"remind me (?:in|after) (\d+(?:\.\d+)?) ?(seconds?|secs?|minutes?|mins?|hours?|hrs?) (?:to |that |about )?(.+)$", text)
+    if match:
+        amount = float(match.group(1))
+        unit = match.group(2)
+        if unit.startswith("sec"):
+            amount = amount / 60
+        elif unit.startswith(("hour", "hr")):
+            amount = amount * 60
+        return tool_set_reminder(amount, match.group(3))
+    if text in ("what are my reminders", "list my reminders", "my reminders", "show my reminders",
+                "do i have any reminders", "any reminders"):
+        return tool_list_reminders()
+    if text in ("clear my reminders", "clear reminders", "delete my reminders", "delete all reminders",
+                "cancel my reminders", "cancel all reminders"):
+        return tool_clear_reminders()
+    if re.fullmatch(r"(?:what(?:'s| is) )?(?:the )?weather(?: like)?(?: today| now| right now)?", text):
+        return tool_get_weather(HOME_CITY)
+    match = re.match(r"(?:what(?:'s| is) )?(?:the )?weather (?:in|for|at) (.+?)(?: today| now)?$", text)
+    if match:
+        return tool_get_weather(match.group(1))
+
     match = re.match(r"open (?:the )?(.+?)(?: website| app| application)?$", text)
     if match:
         spoken = match.group(1)
@@ -1642,6 +1851,7 @@ def jarvis_loop():
     check_brains()
     describe_browser()
     print("------------------------")
+    start_reminders()
 
     if USE_WAKE_WORD:
         calibrate()

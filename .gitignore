@@ -8,3 +8,4 @@ jarvis.log
 .env
 jarvis_browser_profile/
 .kilo/
+jarvis_reminders.json
