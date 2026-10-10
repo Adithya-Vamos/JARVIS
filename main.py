@@ -1019,6 +1019,57 @@ def tool_forget(keyword):
     return f"Removed {len(facts) - len(kept)} memory item(s)."
 
 
+SHOT_DIR = os.path.join(os.path.expanduser("~"), "Pictures", "Jarvis")
+
+CLOSE_APPS = {
+    "notepad": "notepad.exe",
+    "calculator": "CalculatorApp.exe",
+    "command prompt": "cmd.exe",
+    "task manager": "Taskmgr.exe",
+    "paint": "mspaint.exe",
+    "chrome": "chrome.exe",
+    "spotify": "Spotify.exe",
+}
+
+FOLDERS = ("downloads", "documents", "desktop", "pictures", "music", "videos")
+
+
+def tool_take_screenshot():
+    try:
+        from PIL import ImageGrab
+    except Exception:
+        return "I need Pillow for that. Run: python -m pip install pillow"
+    os.makedirs(SHOT_DIR, exist_ok=True)
+    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    ImageGrab.grab().save(os.path.join(SHOT_DIR, "shot_" + stamp + ".png"))
+    return "Screenshot saved in your Pictures, Jarvis folder."
+
+
+def tool_close_app(name):
+    key = name.lower().strip()
+    exe = CLOSE_APPS.get(key)
+    if not exe:
+        return "I can close: " + ", ".join(CLOSE_APPS)
+    result = run_hidden(["taskkill", "/IM", exe], capture_output=True, text=True)
+    if result.returncode == 0:
+        return "Closed " + key + "."
+    return key + " does not seem to be open."
+
+
+def tool_lock_pc():
+    run_hidden(["rundll32.exe", "user32.dll,LockWorkStation"])
+    return "Locking the PC."
+
+
+def tool_open_folder(name):
+    key = name.lower().strip()
+    if key not in FOLDERS:
+        return "I can open: " + ", ".join(FOLDERS)
+    os.startfile(os.path.join(os.path.expanduser("~"), key.capitalize()))
+    mark_quiet()
+    return "Opened " + key + "."
+
+
 STR = {"type": "STRING"}
 NUM = {"type": "NUMBER"}
 
@@ -1065,6 +1116,17 @@ TOOLS = [{"functionDeclarations": [
     {"name": "forget",
      "description": "Delete saved memory items that contain a keyword.",
      "parameters": params({"keyword": STR}, ["keyword"])},
+    {"name": "take_screenshot",
+     "description": "Take a screenshot of the whole screen and save it in the Pictures folder."},
+    {"name": "close_app",
+     "description": "Close an app politely. Available: notepad, calculator, command prompt, "
+                    "task manager, paint, chrome, spotify.",
+     "parameters": params({"name": STR}, ["name"])},
+    {"name": "lock_pc",
+     "description": "Lock the Windows PC screen."},
+    {"name": "open_folder",
+     "description": "Open a folder in File Explorer: downloads, documents, desktop, pictures, music or videos.",
+     "parameters": params({"name": STR}, ["name"])},
 ]}]
 
 FUNCTIONS = {
@@ -1080,6 +1142,10 @@ FUNCTIONS = {
     "get_weather": tool_get_weather,
     "remember": tool_remember,
     "forget": tool_forget,
+    "take_screenshot": tool_take_screenshot,
+    "close_app": tool_close_app,
+    "lock_pc": tool_lock_pc,
+    "open_folder": tool_open_folder,
 }
 
 
@@ -1367,6 +1433,17 @@ def fast_command(text):
         for name in APPS:
             if norm(name) == key:
                 return tool_open_app(name)
+
+    if text in ("take a screenshot", "take screenshot", "screenshot", "capture the screen"):
+        return tool_take_screenshot()
+    if text in ("lock the pc", "lock pc", "lock my pc", "lock the computer", "lock the screen", "lock screen"):
+        return tool_lock_pc()
+    match = re.match(r"close (?:the )?(.+)$", text)
+    if match and match.group(1) in CLOSE_APPS:
+        return tool_close_app(match.group(1))
+    match = re.match(r"open (?:the )?(downloads|documents|desktop|pictures|music|videos)(?: folder)?$", text)
+    if match:
+        return tool_open_folder(match.group(1))
 
     match = re.match(r"play (.+?)(?: on youtube)?$", text)
     if match:
