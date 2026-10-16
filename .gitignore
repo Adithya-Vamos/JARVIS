@@ -9,3 +9,7 @@ jarvis.log
 jarvis_browser_profile/
 .kilo/
 jarvis_reminders.json
+jarvis_notes.json
+jarvis_todo.json
+google_credentials.json
+jarvis_google_token.json
